@@ -224,10 +224,10 @@ CloakBrowser accepts SOCKS5 natively: `proxy="socks5://user:pass@host:port"`.
 │   └── test-targets.md                          canonical detection sites + how to read mixed results
 └── skills/
     └── hermes/
-        └── stealth-browser-automation/
+        └── stealth-browser-automation/          self-contained, drop-in
             ├── SKILL.md                         Hermes Agent skill format
-            ├── references/test-targets.md       (symlinked to ../references)
-            └── scripts/probe.py                 (symlinked to ../scripts)
+            ├── references/test-targets.md
+            └── scripts/probe.py
 ```
 
 ---
