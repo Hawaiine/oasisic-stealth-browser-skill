@@ -1,6 +1,11 @@
 # Stealth Browser Automation — Agent Playbook
+### 反爬虫战场实战手册 · 给 AI agent 直接消费的单文件版
 
 Single-file playbook for any AI coding agent (Claude Code, Cursor, OpenCode, Aider, Continue, OpenClaude, Hermes Agent, etc.) or human. Drop this into your project, reference it from your agent's instruction file, or read it top-to-bottom.
+
+> **一句话：** Cloudflare / Turnstile / FingerprintJS / DataDome 把你的爬虫拦在 "Just a moment..." 那一页时，按这份手册的两层策略走：80% 的检测站点 tier-1 一行 `launch(humanize=True)` 就能过；剩下 20% 的硬骨头用 tier-2（住宅代理 + Xvfb 有头 + geoip）。
+>
+> **关键认知：** 数据中心 IP 像穿西装去夜店 —— 衣冠楚楚但一眼假。CF 在 IP 那一层就把你 403 了，根本不会让你的浏览器有机会展示指纹。**先诊断再调参。**
 
 The repo it lives in: <https://github.com/Hawaiine/oasisic-stealth-browser-skill>
 

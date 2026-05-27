@@ -1,62 +1,97 @@
 # Stealth Browser Automation Playbook
+### 反爬虫战场的实战手册 · 给所有 AI agent 和真人用的
 
-Battle-tested playbook for scraping and automating sites behind **Cloudflare**, **Turnstile**, **FingerprintJS**, **BrowserScan**, **DataDome** and similar anti-bot stacks — using [CloakBrowser](https://pypi.org/project/cloakbrowser/), a source-patched Chromium that drops in for Playwright.
-
-This repo distills hands-on findings from real targets: **what works tier-1 (headless, datacenter IP), when to escalate to tier-2 (residential proxy + Xvfb headed + humanize + geoip), and the pitfalls that cost hours to discover.** It ships in two formats:
-
-- **[`PLAYBOOK.md`](./PLAYBOOK.md)** — universal playbook readable by any agent or human (Claude Code, Cursor, OpenCode, Aider, Continue, OpenClaude, plain humans, etc.)
-- **[`skills/hermes/stealth-browser-automation/`](./skills/hermes/stealth-browser-automation/)** — drop-in [Hermes Agent](https://hermes-agent.nousresearch.com) skill format with frontmatter + linked references
-
-A ready-to-run **`probe.py`** runs your stealth install against four canonical detection sites and reports PASS/FAIL with screenshots, so you can validate the stack before pointing it at a real target.
+> **一句话简介 (TL;DR)**
+> Cloudflare 又把你拦在"Just a moment..."那一页了？这是一份在真实战场上磨出来的手册，配套一个能直接 drop-in 替换 Playwright 的隐身浏览器（[CloakBrowser](https://pypi.org/project/cloakbrowser/)），帮你穿过 Cloudflare、Turnstile、FingerprintJS、BrowserScan、DataDome 的层层关卡。
+>
+> **80% 的检测站点**只要 `launch(humanize=True)` 一行代码就能过。剩下 20% 的硬骨头（CF Bot Management 全开、Turnstile 互动验证、DataDome、Kasada、极验）需要 tier-2：住宅代理 + Xvfb 有头模式 + geoip 时区匹配。两套打法都在下面。
 
 ---
 
-## TL;DR — the two-tier playbook
+## 这个项目解决什么问题
 
-```
-Tier-1  ~80% of detection sites pass:  launch(humanize=True)
-                                       headless, datacenter IP, no proxy
-                                       beats nowsecure.nl, BrowserScan,
-                                       FingerprintJS demo
+你写了一个爬虫，本地跑得好好的，丢到服务器上就 403。你换了 `playwright-stealth`，还是 403。换 `undetected-chromedriver`，过两周 Chrome 一更新又挂了。
 
-Tier-2  Aggressive sites (full CF Bot Management, Turnstile interactive,
-        DataDome, Kasada, 极验 GeeTest):
-            launch(proxy="http://user:pass@residential-host:port",
-                   geoip=True, headless=False, humanize=True)
-        + run under Xvfb on Linux servers
-```
+问题的根源是：**反爬虫这事已经不是 1v1 的代码博弈了，而是 ML 评分系统**。Cloudflare、FingerprintJS、DataDome 在背后给每个请求打分 —— 浏览器指纹、行为模式、IP 段、TLS 指纹，全维度打分一起看。你光把 webdriver 标志改成 false，分数才扣两分而已。
 
-If tier-1 fails on your target, **diagnose IP-side vs fingerprint-side first** (see [Diagnose the failure](#diagnose-the-failure-ip-side-vs-fingerprint-side) below) before tweaking flags. CF refuses datacenter IPs at the IP layer regardless of fingerprint quality, and no amount of browser tuning fixes that.
+CloakBrowser 的思路是：**不在运行时打补丁，直接改 Chromium 源码重新编译**。所以检测站点看到的是一个"真"浏览器 —— 因为它真的就是。配合这本手册里总结的 tier-1/tier-2 双层策略，能把大部分 CF 站点啃下来。
+
+This repo distills hands-on findings from real targets: **what works tier-1 (headless, datacenter IP), when to escalate to tier-2 (residential proxy + Xvfb headed + humanize + geoip), and the pitfalls that cost hours to discover.**
+
+It ships in two formats:
+
+- **[`PLAYBOOK.md`](./PLAYBOOK.md)** — 单文件手册，丢给任何 agent 都能读（Claude Code、Cursor、OpenCode、Aider、Continue、OpenClaude，或者真人）
+- **[`skills/hermes/stealth-browser-automation/`](./skills/hermes/stealth-browser-automation/)** — [Hermes Agent](https://hermes-agent.nousresearch.com) 原生 skill 格式，clone 完直接 `cp -r` 进 `~/.skills/`
+
+A ready-to-run **`scripts/probe.py`** runs your install against four canonical detection sites and reports PASS/FAIL with screenshots. 装完先跑一遍，确认武器没问题再上战场。
 
 ---
 
-## Why CloakBrowser over the alternatives
+## 一图看懂两层打法
 
-| Tool | Patch level | Cloudflare Turnstile | Survives Chrome updates |
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Tier-1  ── 便装上街，对付 80% 的检测站点                   │
+│                                                             │
+│      launch(humanize=True)                                  │
+│      ├── headless 无头                                      │
+│      ├── 数据中心 IP 也行                                   │
+│      └── 不需要代理                                         │
+│                                                             │
+│      ✓ nowsecure.nl                                         │
+│      ✓ BrowserScan bot detection                            │
+│      ✓ FingerprintJS demo (Bot: Not detected)               │
+│      ✓ 大部分只看指纹的 CF 防护                             │
+└─────────────────────────────────────────────────────────────┘
+                          ⬇ 顶不住时升级
+┌─────────────────────────────────────────────────────────────┐
+│  Tier-2  ── 穿邻居衣服借邻居车，啃硬骨头                    │
+│                                                             │
+│      launch(                                                │
+│          proxy="http://user:pass@residential:port",         │
+│          geoip=True,        # 时区/语言自动匹配代理 IP      │
+│          headless=False,    # Linux 服务器配 Xvfb           │
+│          humanize=True,     # 贝塞尔曲线鼠标 + 真人打字     │
+│      )                                                      │
+│                                                             │
+│      ✓ Cloudflare Bot Management 全开                       │
+│      ✓ Turnstile 互动验证                                   │
+│      ⚠ DataDome / Kasada / 极验 (尽力但不保证)              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+> **关键认知 / Key insight**
+> 数据中心 IP 就像穿西装去夜店蹦迪 —— 衣冠楚楚但一眼假。CF 在 IP 这一层就把你 403 掉了，根本不会让你的浏览器有机会展示指纹。**先诊断再调参**，否则你只是在改一个 CF 根本没看到的浏览器。
+
+---
+
+## 为什么不用 playwright-stealth / undetected-chromedriver / nodriver
+
+| 工具 | 补丁层级 | Cloudflare Turnstile | 抗 Chrome 升级 |
 |---|---|---|---|
-| `playwright-stealth` | JS injection | Sometimes | Breaks often |
-| `undetected-chromedriver` | Config patches | Sometimes | Breaks often |
-| nodriver / Camoufox | C++ (Firefox fork) | Pass | Yes, but unstable |
-| **CloakBrowser** | C++ Chromium source | **Pass** | Yes, actively maintained |
+| `playwright-stealth` | 运行时注入 JS | 偶尔能过 | 经常崩 |
+| `undetected-chromedriver` | 配置改改 | 偶尔能过 | 经常崩 |
+| nodriver / Camoufox | C++ 改 (Firefox 分支) | 能过 | 能扛但不稳 |
+| **CloakBrowser** | **C++ 改 Chromium 源码** | **稳过** | **稳，活跃维护** |
 
-Patches are compiled into the C++, not injected at runtime, so detection sites see a real browser because it *is* a real browser. If a session uses `playwright-stealth` and gets blocked, switch to CloakBrowser before touching anything else.
+补丁编进 C++、不是运行时注入 —— 这是和其他方案最本质的区别。如果你的 session 用 `playwright-stealth` 被拦了，先换 CloakBrowser，别先怀疑别的。
 
 ---
 
-## Install
+## 安装 / Install
 
 ```bash
 mkdir -p stealth && cd stealth
 python -m venv .venv && source .venv/bin/activate
 pip install cloakbrowser
-cloakbrowser install      # ~206MB download, ~30s
+cloakbrowser install      # ~206MB 二进制，~30s 下完
 ```
 
-Binary lands under `~/.cloakbrowser/chromium-<ver>/chrome` and auto-updates in background.
+Chromium 二进制装在 `~/.cloakbrowser/chromium-<ver>/chrome`，会在后台自动更新。
 
-**System deps (Debian/Ubuntu):** `libnss3 libatk-bridge2.0-0 libatk1.0-0 libgbm1 libasound2 xvfb` — already present on most server images.
+**Debian / Ubuntu 系统依赖：** `libnss3 libatk-bridge2.0-0 libatk1.0-0 libgbm1 libasound2 xvfb` —— 主流服务器镜像基本都自带。
 
-CloakBrowser exports a Playwright-compatible API; existing Playwright code migrates with one import swap.
+CloakBrowser 暴露的是 Playwright 兼容 API，已有 Playwright 代码改一行 import 就能迁过来。
 
 ---
 
@@ -65,174 +100,175 @@ CloakBrowser exports a Playwright-compatible API; existing Playwright code migra
 ```python
 from cloakbrowser import launch
 
-browser = launch(humanize=True)               # tier-1 default
+# Tier-1: 一行搞定 80% 的站点
+browser = launch(humanize=True)
 page = browser.new_page()
 page.goto("https://nowsecure.nl/")
 print(page.title())
 browser.close()
 ```
 
-For tier-2:
+Tier-2 升级版：
 
 ```python
 browser = launch(
-    proxy="http://user:pass@residential-host:port",  # MUST be residential
-    geoip=True,        # match TZ + locale to proxy IP (auto WebRTC IP spoof)
-    headless=False,    # under Xvfb on Linux servers
-    humanize=True,     # Bezier mouse, per-character typing, realistic scroll
+    proxy="http://user:pass@residential-host:port",  # 必须是住宅 IP
+    geoip=True,        # 时区/locale 跟代理 IP 对齐 (顺手伪造 WebRTC IP)
+    headless=False,    # Linux 服务器要配 Xvfb
+    humanize=True,     # 贝塞尔鼠标 + 逐字符打字 + 真实滚动
 )
 ```
 
-On a headless server, run under Xvfb: `xvfb-run -a python script.py`.
+无头服务器跑有头模式： `xvfb-run -a python script.py`
 
 ---
 
-## Verify the install with the probe
+## 装完先跑探针 / Verify with the probe
 
-[`scripts/probe.py`](./scripts/probe.py) runs against four canonical detection sites, screenshots each result, and prints PASS/FAIL based on HTTP status + body-text heuristics (titles lie — a 403 CF challenge page often has a normal-looking title).
+[`scripts/probe.py`](./scripts/probe.py) 会拿你的 stealth 装备去打四个检测站，每个截图存档，根据 HTTP 状态 + 页面文本判 PASS/FAIL（光看 title 会被骗 —— 一个 CF 403 challenge 页的 `<title>` 也可能正常）。
 
 ```bash
-# tier-1 (headless, no proxy)
+# Tier-1: 无头 + 数据中心 IP
 python scripts/probe.py
 
-# tier-2 (headed under Xvfb, with proxy)
+# Tier-2: 有头 + 住宅代理
 PROXY="http://user:pass@residential-host:port" GEOIP=1 \
   XVFB=1 xvfb-run -a python scripts/probe.py
 ```
 
-Output goes to `/tmp/cloak-probe/` (override with `OUT=...`).
+输出落在 `/tmp/cloak-probe/`（用 `OUT=` 改）。
 
-**Recorded baseline** (CloakBrowser 0.3.31, Chromium 146, Linux Debian 13, datacenter egress, tier-1 `launch(humanize=True)`):
+**实测基线** (CloakBrowser 0.3.31, Chromium 146, Linux Debian 13, 数据中心级出口 IP, 仅 tier-1)：
 
 ```
-nowsecure.nl                        ✅ HTTP 200, body "NOWSECURE BY NODRIVER"
-browserscan.net/bot-detection       ✅ HTTP 200, "Test Results: Normal" (4/4 green)
-demo.fingerprint.com/playground     ✅ HTTP 200, Bot: Not detected, Visitor ID issued
+nowsecure.nl                        ✅ HTTP 200, 页面 "NOWSECURE BY NODRIVER"
+browserscan.net/bot-detection       ✅ HTTP 200, "Test Results: Normal" (4/4 全绿)
+demo.fingerprint.com/playground     ✅ HTTP 200, Bot: Not detected, 拿到 Visitor ID
                                       ⚠️ Browser Tampering: Yes 🖥️🔧
-                                      ⚠️ UA reported as Chrome 146 / Windows 11 (spoofed)
+                                      ⚠️ UA 报为 Chrome 146 / Windows 11 (伪造的)
 nopecha.com/demo/cloudflare         ❌ HTTP 403, Ray ID ...
                                       "Performing security verification"
 ```
 
-The nopecha failure on tier-1 is **expected and informative** — it tells you that fingerprint patches are working, but full CF Bot Management still rejects datacenter IPs regardless of clean signals. Promote to tier-2 for that class of site.
+最后一行的失败是**预期且有信息量的** —— 它告诉你指纹补丁工作正常，但 CF 完整版 Bot Management 在 IP 这层就把你毙了，跟你的浏览器伪装得多像没关系。这种站点必须升级到 tier-2。
 
 ---
 
-## Diagnose the failure: IP-side vs fingerprint-side
+## 失败诊断：是指纹问题还是 IP 问题？
 
-When a target returns 403 / challenge, **don't tweak browser flags blindly**. Two-step triage:
+目标站返回 403 / 卡在 challenge 时，**别瞎调浏览器参数**。先做两步分诊：
 
 ```bash
-# 1. What ASN is your egress?
+# 1. 你这台机器是什么 ASN？
 curl -s "https://ipinfo.io/$(curl -s https://api.ipify.org)/json" | jq .org
-# Datacenter:   "AS14061 DigitalOcean", "AS16509 Amazon", "AS36352 HostPapa"
-# Residential: "AS4837 China Unicom", "AS7922 Comcast", "AS3320 Deutsche Telekom"
+# 数据中心:  "AS14061 DigitalOcean", "AS16509 Amazon", "AS36352 HostPapa"
+# 住宅:      "AS4837 China Unicom", "AS7922 Comcast", "AS3320 Deutsche Telekom"
 
-# 2. Did CF inject the challenge widget, or reject at IP layer?
-# In the page after navigation, evaluate:
+# 2. CF 是注入了 challenge 控件，还是直接在 IP 层把你打回去了？
+# 在页面打开后跑这段 JS：
 #   document.querySelector('iframe[src*="challenges.cloudflare.com"]')
 ```
 
-| Signal | IP-layer block | Challenge-layer block |
+| 信号 | IP 层拦截 | challenge 层拦截 |
 |---|---|---|
-| HTTP status | 403 | 403 (often) or 200 stuck on challenge |
-| `cf-mitigated` header | `challenge` | `challenge` |
-| Turnstile iframe in DOM | **absent** | **present** |
-| Repeat behavior | Identical 403 every time | Varies with humanize/timing |
-| What helps | **Different egress IP only** | Tweak headed/humanize/cookies |
+| HTTP 状态码 | 403 | 403（常见）或 200 卡在 challenge |
+| `cf-mitigated` 响应头 | `challenge` | `challenge` |
+| Turnstile iframe 在 DOM | **找不到** | **能找到** |
+| 重复访问行为 | 每次都是一样的 403 | 偶尔能过，看 humanize/timing |
+| 怎么救 | **必须换出口 IP** | 调有头/humanize/cookie |
 
-**If iframe is absent and HTTP is 403, no amount of CloakBrowser tuning will help.** CF refused to even run the challenge. The only fix is a different egress IP.
+**iframe 找不到 + 403 = CF 在 IP 层就把你拒了，不管你浏览器调成什么样都没用。** 唯一出路是换 IP（住宅代理 / SSH SOCKS5 到家里的盒子 / 4G 网卡 等等）。
 
 ---
 
-## Pitfalls discovered in real testing
+## 真实战场上踩过的坑 / Pitfalls discovered in real testing
 
-These cost hours when discovered the hard way. Listed roughly in order of how often they bite.
+按"踩坑频率"从高到低排：
 
-- **`Browser Tampering: Yes 🖥️🔧` on FingerprintJS** even when `Bot: Not detected`. The C++ patches *are* visible to fingerprint.com's tampering heuristic. Bot-score-only sites pass; sites that gate on tampering will reject. Mitigation: tier-2 (proxy + geoip) sometimes resolves; otherwise no clean fix today.
+- **FingerprintJS 显示 `Browser Tampering: Yes 🖥️🔧`** 哪怕 `Bot: Not detected`。C++ 补丁在 fingerprint.com 的 tampering 启发式里**是会被看到的**。只看 bot 分的站点能过；明确门槛设在 tampering 那条的站点会拒。tier-2 (proxy + geoip) 偶尔能掩盖，目前没有干净的修复方案。
 
-- **Datacenter IP → CF 403 even on tier-1.** Clean fingerprints don't matter when the ASN is on a deny list. Don't blame the patches; bring a residential proxy. Confirm with the diagnose step above.
+- **数据中心 IP 让 CF 直接 403，连 tier-1 都顶不住。** nopecha 的 CF demo 在指纹完全干净的情况下还是返回 `HTTP 403, Ray ID ..., Performing security verification`。ISP/ASN 是评分的一部分。**别怪补丁，去拿个住宅代理。** 上面的诊断步骤能确认这一点。
 
-- **Timezone / IP mismatch is its own detection signal.** Without `geoip=True`, the browser reports `timezone: UTC, getTimezoneOffset: 0` while the egress IP geo-locates elsewhere. Bot-management ML cross-checks this. Always pair `proxy=` with `geoip=True` in tier-2; never run tier-2 with one and not the other.
+- **时区和 IP 不匹配本身就是检测信号。** 不开 `geoip=True` 的话，浏览器报 `timezone: UTC, getTimezoneOffset: 0`，但出口 IP 地理位置在别处。Bot management ML 会做交叉校验。tier-2 永远 `proxy=` 和 `geoip=True` 一起用，从来不要只开一个。
 
-- **Pure headless can fail Turnstile interactive / managed.** Some sites cross-check headless heuristics (window focus, viewport timing) independent of fingerprint. Promote to `headless=False` under Xvfb before adding more flags.
+- **纯无头也能在 Turnstile 互动验证上翻车。** 有些站点会交叉检查 headless 启发式（窗口聚焦、视口时序），跟指纹无关。先升级到 `headless=False` 配 Xvfb，再考虑加别的 flag。
 
-- **`xvfb-run` fails with `xauth command not found`** on minimal Debian/Ubuntu containers without root to `apt install xauth`. Workaround — start Xvfb directly and export `DISPLAY`:
+- **`xvfb-run` 在没装 `xauth` 的极简容器里报 `xauth command not found`**，没 root 没法 `apt install`。绕开方法：直接起 Xvfb 然后导出 DISPLAY：
   ```bash
   Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
   DISPLAY=:99 python script.py
   ```
-  Verify with `pgrep -a Xvfb` and `ls /tmp/.X11-unix/X99`.
+  用 `pgrep -a Xvfb` 和 `ls /tmp/.X11-unix/X99` 验证。这样绕过 `xvfb-run` 包装器，非 root 也能跑。
 
-- **Manually unpacking Chromium via `python -c "zipfile.ZipFile(...).extractall(...)"` strips the Unix `+x` mode bit.** Browser launches with `chrome_crashpad_handler: Permission denied (13)` then SIGTRAP. Python's stdlib `zipfile` doesn't preserve POSIX permissions. Fix:
+- **手动用 `python -c "zipfile.ZipFile(...).extractall(...)"` 解压 Chromium 会丢掉 Unix `+x` 权限位。** 浏览器启动报 `chrome_crashpad_handler: Permission denied (13)` 然后 SIGTRAP / `Received signal 6`。原因是极简容器没装 `unzip`，回退到 Python stdlib（`zipfile` 不保留 POSIX 权限）。修：
   ```bash
   cd <chromium-dir>/chrome-linux64
   find . -type f -exec sh -c 'head -c 4 "$1" | grep -q ELF && chmod +x "$1"' _ {} \;
   ```
-  Cleaner: install `unzip` (`apt install unzip`) before extracting. CloakBrowser's own installer uses `unzip`; this only bites when hand-rolling installs in `unzip`-less environments.
+  更干净的做法：解压前 `apt install unzip`。CloakBrowser 自己的 installer 不会有这问题，因为它直接 shell out 到 `unzip`；只有手动装 Playwright Chromium 在没 `unzip` 的环境里才会踩。
 
-- **Playwright searches for `chrome-linux/chrome` not `chrome-linux64/chrome`.** When manually installing Chromium for Testing (`cdn.playwright.dev/builds/cft/<ver>/linux64/chrome-linux64.zip`), the archive extracts to `chrome-linux64/`. Symlink it: `ln -sfn chrome-linux64 chrome-linux` inside the version directory. Also pass `channel='chromium'` to `launch()` — the default selects `chromium_headless_shell`, a *different* binary that won't be present unless installed separately.
+- **Playwright 找的是 `chrome-linux/chrome` 不是 `chrome-linux64/chrome`。** 手动装 Chromium for Testing (`cdn.playwright.dev/builds/cft/<ver>/linux64/chrome-linux64.zip`) 时，压缩包解出来是 `chrome-linux64/`。建个软链：`ln -sfn chrome-linux64 chrome-linux` 在版本目录里。另外 `launch()` 要传 `channel='chromium'` —— 默认会去找 `chromium_headless_shell`，那是**另一个**二进制，没单独装的话不存在。
 
-- **First-run downloads 206MB.** Account for it in cron / CI; cache `~/.cloakbrowser/` between runs.
+- **首次跑要下 206MB。** 上 cron / CI 时算进时间，并把 `~/.cloakbrowser/` 缓存好。
 
-- **Ko-fi banner prints to stdout** every install. Strip it when capturing logs.
+- **每次 install 都会打印 Ko-fi 横幅** 到 stdout。日志采集时记得过滤。
 
-- **Screenshots can lie** — always check `response.status` and grep page body for blocking markers (`just a moment`, `checking your browser`, `verifying you are human`, `attention required`, `access denied`, `performing security verification`, `ray id`). A 403 often still renders a "Just a moment..." page that a naive title check passes.
+- **截图会骗人** —— 一定要同时检查 `response.status` 和页面正文里的拦截关键词（`just a moment`、`checking your browser`、`verifying you are human`、`attention required`、`access denied`、`performing security verification`、`ray id`）。一个 403 页可能渲染成普通的 "Just a moment..."，只看 title 会以为成功了。
 
-- **Use `launch_persistent_context(user_data_dir=...)` for repeat visits** — keeps cookies / localStorage across sessions, bypasses incognito-detection signals, and lets a successful CF clearance cookie persist for hours. Cheaper than burning a fresh challenge per run.
+- **重复访问用 `launch_persistent_context(user_data_dir=...)`** —— 跨 session 保留 cookie / localStorage，绕过隐身模式检测，让 CF clearance cookie 能续上几小时。比每次重过一次 challenge 便宜得多。
 
-- **Cloudflare Turnstile widgets render in a closed shadow root.** `document.querySelectorAll('iframe')` and `document.getElementsByTagName('iframe')` return empty even when the widget is fully visible. Use `page.frames` (Playwright/CDP-level) to detect the CF iframe — its URL matches `challenges.cloudflare.com/.../turnstile/...`. Do NOT call `page.set_viewport_size()` after `goto()`; it can re-trigger CF's bot-score and break challenge mounting. Set viewport at context creation (or rely on Xvfb's screen size).
+- **Cloudflare Turnstile 控件渲染在 closed shadow root 里。** `document.querySelectorAll('iframe')` 和 `getElementsByTagName('iframe')` 都返回空 —— 哪怕控件正在你眼前显示。要用 `page.frames` (Playwright/CDP 层) 才能拿到 CF iframe，URL 形如 `challenges.cloudflare.com/.../turnstile/...`。**不要**在 `goto()` 之后调 `page.set_viewport_size()`，会重新触发 CF 评分把 challenge 挂掉。viewport 在 context 创建时一次设好（或者直接靠 Xvfb 的屏幕尺寸）。
 
-- **Turnstile interactive checkbox in tier-2 (headed Xvfb): blind-click works.** The widget lives in a closed shadow root, so neither DOM queries nor `frame_locator` can find the visible checkbox. Workaround: take a screenshot, ask vision for pixel coords of the unchecked checkbox, then `page.mouse.click(x, y, delay=80)` with a humanized 2-3-hop approach. Token reliably appears within 30-90s after click. Checkbox sits ~30px from the widget's left edge.
+- **Tier-2 (有头 Xvfb) 下点 Turnstile 互动复选框：盲点能用。** 控件在 closed shadow root 里，DOM query 和 `frame_locator` 都找不到那个可见的复选框。绕开方式：截图 → 让 vision 给出复选框像素坐标 → `page.mouse.click(x, y, delay=80)`，配合 2-3 跳的拟人化路径。点完 30-90 秒内 token 会稳定出现。复选框一般在控件左边缘内 ~30px。
 
-- **`render=explicit` + `window.turnstile` undefined ≠ blocked.** When you intercept early via `add_init_script`, the patched `window.turnstile` getter/setter prevents the real script from initializing. Don't add init-scripts that touch `window.turnstile`. Use page-level `page.evaluate` after the widget mounts.
-
----
-
-## Cheap residential-IP options when no proxy budget
-
-Tier-2 needs residential egress. Before paying for BrightData / Smartproxy / IPRoyal:
-
-- **Your own home network.** SSH from the server to your home box: `ssh -D 1080 -N user@home-box`, then point CloakBrowser at `proxy="socks5://127.0.0.1:1080"` plus `geoip=True`. Free, real residential ASN, real geolocation.
-- **Mobile tethering / 5G dongle.** Most carrier mobile IPs are classified residential / mobile by CF; works for low-volume scraping.
-- **A friend's home / second residence.** Same SOCKS5 trick.
-- Only fall back to paid residential proxies (IPRoyal pay-as-you-go ~$2/GB is cheapest) when none of the above is available.
-
-CloakBrowser accepts SOCKS5 natively: `proxy="socks5://user:pass@host:port"`.
+- **`render=explicit` + `window.turnstile undefined` ≠ 被拦了。** 你用 `add_init_script` 早期介入时，那个被打了补丁的 `window.turnstile` getter/setter 反而会阻止真正的 turnstile 脚本初始化。**别**在 init script 里碰 `window.turnstile`。要看 API 的话用 `page.evaluate`，等控件已经挂载之后再调。
 
 ---
 
-## When CloakBrowser is the wrong tool
+## 没预算买代理时的住宅 IP 替代方案
 
-- **Sign-in / check-in flows that expose a JSON API** → hit the API directly with a session cookie. Faster, idempotent, doesn't need a 200MB browser. Reverse-engineer from the JS bundle.
-- **CAPTCHA solving** — CloakBrowser *prevents* CAPTCHAs from appearing; it doesn't solve them. If a CAPTCHA still shows, downstream solver (2captcha, capsolver) is needed.
-- **Pure HTTP scraping** of unprotected JSON endpoints — `curl`/`httpx` is enough. Don't reach for a stealth browser if there's no JS challenge.
-- **DataDome, Kasada, 极验 GeeTest, PerimeterX** — headed + residential is *necessary but not always sufficient*. Plan for fallback: solver service or human-in-the-loop. CloakBrowser README acknowledges these limits.
+Tier-2 必须住宅出口。在掏钱买 BrightData / Smartproxy / IPRoyal 之前，先看看手边有什么：
+
+- **🏠 自己家的网络。** 家里有宽带的话，从服务器 SSH 过去：`ssh -D 1080 -N user@home-box`，然后 CloakBrowser 指过去：`proxy="socks5://127.0.0.1:1080"` 加 `geoip=True`。免费、真住宅 ASN、真地理位置。
+- **📱 手机热点 / 5G 上网卡。** 大部分运营商移动 IP 被 CF 归类为住宅/移动，低频抓取够用。
+- **👨‍👩‍👧 朋友家 / 第二个住处。** 同样的 SOCKS5 套路。CloakBrowser 原生支持 SOCKS5：`proxy="socks5://user:pass@host:port"`。
+- 实在没辙再去买付费住宅代理。IPRoyal 按量付费 ~$2/GB 算便宜的。
 
 ---
 
-## Repo layout
+## 什么时候 CloakBrowser 是错的工具
+
+不是所有反爬场景都该上隐身浏览器。下面这些情况掉头去用别的方案：
+
+- **签到 / 打卡类有 JSON API 的** → 直接打 API 配 session cookie。更快、幂等、不需要 200MB 的浏览器。逆向方法：从前端 JS bundle 里挖出 endpoint。
+- **真的弹出了 CAPTCHA** → CloakBrowser 是**预防** CAPTCHA 出现，不是解 CAPTCHA。真弹了你需要下游打码服务（2captcha、capsolver）。
+- **目标站根本没 JS challenge，纯 HTTP 抓 JSON** → `curl` / `httpx` 就够了，别拿大炮打蚊子。
+- **DataDome、Kasada、极验 GeeTest、PerimeterX** —— README 自己也承认这些。有头 + 住宅是**必要但不充分**条件。打算上这些站点时记得规划 fallback：打码服务或 human-in-the-loop。
+
+---
+
+## 仓库结构 / Repo layout
 
 ```
 .
-├── README.md                                    you are here
-├── PLAYBOOK.md                                  agent-readable single-file playbook
+├── README.md                                    你正在看的文件
+├── PLAYBOOK.md                                  单文件 agent 手册
 ├── LICENSE                                      MIT
 ├── scripts/
-│   └── probe.py                                 4-target detection probe
+│   └── probe.py                                 4-站检测探针
 ├── references/
-│   └── test-targets.md                          canonical detection sites + how to read mixed results
+│   └── test-targets.md                          检测站点详解 + 怎么读混合结果
 └── skills/
     └── hermes/
-        └── stealth-browser-automation/          self-contained, drop-in
-            ├── SKILL.md                         Hermes Agent skill format
+        └── stealth-browser-automation/          自包含、可直接 drop-in
+            ├── SKILL.md                         Hermes Agent skill 格式
             ├── references/test-targets.md
             └── scripts/probe.py
 ```
 
 ---
 
-## Use with various AI coding agents
+## 怎么给不同 agent 用 / Use with various AI agents
 
 ### [Hermes Agent](https://hermes-agent.nousresearch.com)
 
@@ -245,31 +281,31 @@ hermes skills list | grep stealth-browser-automation
 
 ### Claude Code / Cursor / OpenCode / Aider / Continue / OpenClaude
 
-Point your agent at [`PLAYBOOK.md`](./PLAYBOOK.md) — it's a single self-contained file with all the install steps, the two-tier strategy, the diagnose flow, and the pitfalls list. Either commit it into your project, drop it into your agent's instruction folder, or paste the relevant section as context.
+把 [`PLAYBOOK.md`](./PLAYBOOK.md) 喂给你的 agent —— 单文件、自包含，装机步骤、双层策略、诊断流程、踩坑清单全在里面。可以提交进项目仓库、放进 agent 的 instruction 目录、或者在需要时直接 paste 相关章节。
 
-For Claude Code specifically:
+Claude Code 专门的：
 ```bash
 mkdir -p .claude && cp PLAYBOOK.md .claude/stealth-browser.md
-# then reference it from CLAUDE.md
+# 然后在 CLAUDE.md 里 reference 它
 ```
 
-### Plain humans
+### 真人
 
-Read [`PLAYBOOK.md`](./PLAYBOOK.md). Run `scripts/probe.py` to validate. The pitfalls section is where the time savings live.
+直接看 [`PLAYBOOK.md`](./PLAYBOOK.md)。跑一遍 `scripts/probe.py` 验证武器没问题。"踩过的坑"那一节是这份手册最值钱的地方。
 
 ---
 
-## Contributing
+## 想贡献？/ Contributing
 
-Hit a pitfall not in the list? Found a target that breaks tier-2 in a new way? PRs welcome. Keep additions specific (target name, what failed, what fixed it) — the value of this repo is concrete observations, not generic advice.
+踩到清单里没有的坑？发现一个用 tier-2 也搞不定的新站点？欢迎 PR。**贡献的关键是具体** —— 站点名 + 失败现象 + 修复方法。这个 repo 的价值在具体观察，不在泛泛而谈的建议。
 
 ---
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT —— 看 [LICENSE](./LICENSE)。
 
-## Credits
+## Credits / 致谢
 
-- [CloakBrowser](https://pypi.org/project/cloakbrowser/) — the actual stealth Chromium that does the heavy lifting.
-- Findings recorded by [Hermes Agent](https://hermes-agent.nousresearch.com) during real-world automation work.
+- [CloakBrowser](https://pypi.org/project/cloakbrowser/) —— 真正干重活的隐身 Chromium。这份手册只是它的使用心得。
+- 实战观察由 [Hermes Agent](https://hermes-agent.nousresearch.com) 在真实自动化任务中积累而来。
