@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# CloakBrowser cache (large binary)
+.cloakbrowser/
+
+# Probe output
+/tmp/cloak-probe/
+results_*.json
+*.png
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets
+.env
+.env.*
+!.env.example
